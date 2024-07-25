@@ -21,6 +21,11 @@ import seaborn as sns
 import pandas as pd
 import wandb
 from torch_geometric.nn import GCNConv
+import torch
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import copy
 
 def parse_args():
     """
@@ -36,7 +41,7 @@ def parse_args():
     parser.add_argument("--lr", help="learning rate", type=float, default=0.0025)
     parser.add_argument("--adam_lr", help="adam learning rate for the local trainings", type=float, default=0.0007)
     parser.add_argument("--nparty", help="# parties", type=int, default=2)
-    parser.add_argument('--use_agreggation', default=True, help='use Adam optimizer or FL aggregations')
+    parser.add_argument('--use_agreggation', default=False, help='use Adam optimizer or FL aggregations')
 
     parser.add_argument("--server_pc", help="the number of data the server holds", type=int, default=100)
     parser.add_argument("--bias", help="degree of non-iid", type=float, default=0.5)
@@ -44,7 +49,7 @@ def parse_args():
 
     ### Training
     parser.add_argument("--niter", help="# iterations", type=int, default=1)
-    parser.add_argument("--local_epoch", help="# local optimization or train", type=int, default=50)
+    parser.add_argument("--local_epoch", help="# local optimization or train", type=int, default=2000)
     parser.add_argument("--batch_size", help="batch size", type=int, default=32)
     parser.add_argument("--gpu", help="no gpu = -1, gpu training otherwise", type=int, default=-1)
     parser.add_argument("--seed", help="seed", type=int, default=1)
@@ -77,7 +82,7 @@ def parse_args():
                                  "min_sum_attack"])
 
     ### MP-SPDZ
-    parser.add_argument('--mpspdz', default=True, action='store_true', help='Run example in multiprocess mode')
+    parser.add_argument('--mpspdz', default=False, action='store_true', help='Run example in multiprocess mode')
     parser.add_argument("--port", help="port for the mpc servers", type=int, default=14000)
     parser.add_argument("--chunk_size", help="data amount send between client and server at once", type=int,
                         default=200)
@@ -91,11 +96,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
-import torch
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
 
 
 def predict(model, test_loader, device):
@@ -170,11 +170,8 @@ def get_net(net_type, num_inputs, num_outputs=10):
     num_inputs: number of inputs of model
     num_outputs: number of outputs/classes
     """
-    if net_type == "lr":
-        import models.lr as lr
-        net = lr.LinearRegression(input_dim=num_inputs, output_dim=num_outputs)
-        print(net)
-    elif net_type == "GCN":
+
+    if net_type == "GCN":
         import models.gcn as gcn
         net = GCN(input_dim=num_inputs, output_dim=num_outputs)
         print(net)
@@ -250,42 +247,6 @@ def evaluate_accuracy(data_iterator, net, device, trigger, dataset):
     dataset: name of the dataset used in the backdoor attack
     """
     net.eval()
-    if wandb.config.dataset == "HAR":
-        correct = 0
-        total = 0
-        successful = 0
-        with torch.no_grad():
-            for i, (inputs, targets) in enumerate(data_iterator):
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-
-                outputs = net(inputs)
-
-                if not torch.isnan(outputs).any():
-                    _, predicted = outputs.max(1)
-                    correct += predicted.eq(targets).sum().item()
-                    total += inputs.shape[0]
-                else:
-                    print("NaN in output of net")
-                    raise ArithmeticError
-
-                if trigger:  # backdoor attack
-                    backdoored_inputs, backdoored_targets = attacks.add_backdoor(inputs, targets, dataset)
-                    backdoored_outputs = net(backdoored_inputs)
-                    if not torch.isnan(backdoored_outputs).any():
-                        _, backdoored_predicted = backdoored_outputs.max(1)
-                        successful += backdoored_predicted.eq(backdoored_targets).sum().item()
-                    else:
-                        print("NaN in output of net")
-                        raise ArithmeticError
-
-        success_rate = successful / total
-        acc = correct / total
-        if trigger:
-            return acc, success_rate
-        else:
-            return acc, None
-
     if wandb.config.dataset == "ESOL":
         total_mse_error = 0
         total_mae_error = 0
@@ -469,66 +430,12 @@ def main():
     backdoor_success_list = []
 
     # model
-    net = get_net(wandb.config.net, num_outputs=num_outputs, num_inputs=num_inputs)
-    net = net.to(device)
-    num_params = torch.cat([xx.reshape((-1, 1)) for xx in net.parameters()], dim=0).size()[
-        0]  # used for FLOD to determine threshold
+    global_model = get_net(wandb.config.net, num_outputs=num_outputs, num_inputs=num_inputs)
+    global_model.to(device)
+    num_params = torch.cat([xx.reshape((-1, 1)) for xx in global_model.parameters()], dim=0).size()[0]  # used for FLOD to determine threshold
     # loss
-    softmax_cross_entropy = nn.CrossEntropyLoss()
     loss_fn = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=wandb.config.adam_lr)
-
-    # perform parameter checks
-    if wandb.config.dnc_b > num_params and wandb.config.aggregation == "divide_and_conquer":
-        wandb.config.dnc_b = num_params  # check for condition in description and fix possible error
-        print("b was larger than the dimension of gradients. Set to dimension of gradients for correctness!")
-
-    if wandb.config.dnc_c * wandb.config.nbyz >= wandb.config.nparty and wandb.config.aggregation == "divide_and_conquer":
-        print("DnC removes all gradients during his computation. Lower c or nbyz, or increase number of devices.")
-
-    if wandb.config.server_pc == 0 and (
-            wandb.config.aggregation in ["fltrust", "flod", "flare"] or wandb.config.byz_type == "fltrust_attack"):
-        raise ValueError(
-            "Server dataset size cannot be 0 when aggregation is FLTrust, MPC FLTrust, FLOD or attack is fltrust attack")
-
-    if wandb.config.dataset == "HAR" and wandb.config.nparty != 30:
-        raise ValueError("HAR only works for 30 workers!")
-
-    # compile server programm for aggregation in MPC
-    if wandb.config.mpspdz:
-        script, players = get_protocol(wandb.config.protocol, wandb.config.players)
-        wandb.config.script, wandb.config.players = script, players
-
-        if wandb.config.aggregation == "fedavg":
-            wandb.config.filename_server = "mpc_fedavg_server"
-            num_gradients = wandb.config.nparty
-        elif wandb.config.aggregation == "fltrust":
-            wandb.config.filename_server = "mpc_fltrust_server"
-            num_gradients = wandb.config.nparty + 1
-        else:
-            raise NotImplementedError
-
-        os.chdir("mpspdz")
-
-        wandb.config.full_filename = f'{wandb.config.filename_server}-{wandb.config.port}-{num_params}-{num_gradients}-{wandb.config.niter}-{wandb.config.chunk_size}-{wandb.config.threads}-{wandb.config.parallels}'
-
-        if not os.path.exists('./Programs/Bytecode'):
-            os.mkdir('./Programs/Bytecode')
-        already_compiled = len(
-            list(filter(lambda f: f.find(wandb.config.full_filename) != -1, os.listdir('./Programs/Bytecode')))) != 0
-
-        if wandb.config.always_compile or not already_compiled:
-            # compile mpc program, arguments -R 64 -X were chosen so that every protocol works
-            os.system(
-                './compile.py -F 64 -X ' + wandb.config.filename_server + ' ' + str(wandb.config.port) + ' ' + str(
-                    num_params) + ' ' + str(num_gradients) + ' ' + str(wandb.config.niter) + ' ' + str(
-                    wandb.config.chunk_size) + ' ' + str(wandb.config.threads) + ' ' + str(wandb.config.parallels))
-
-        # setup ssl keys
-        os.system('Scripts/setup-ssl.sh ' + str(wandb.config.players))
-        os.system('Scripts/setup-clients.sh 1')
-
-        os.chdir("..")
+    optimizer = torch.optim.Adam(global_model.parameters(), lr=wandb.config.adam_lr)
 
     # perform multiple runs
     for run in range(1, wandb.config.nruns + 1):
@@ -546,8 +453,6 @@ def main():
             random.seed(wandb.config.seed)
             np.random.seed(wandb.config.seed)
 
-        net.apply(weight_init)  # initialization of model
-
         # set aggregation specific variables
         if wandb.config.aggregation == "shieldfl":
             previous_global_gradient = 0  # important for ShieldFL, all other aggregation rules don't need it
@@ -564,29 +469,18 @@ def main():
         elif wandb.config.aggregation == "romoa":
             # don't know why they initialize it like this
             previous_global_gradient = torch.cat(
-                [param.clone().detach().flatten() for param in net.parameters()]).reshape(-1, 1) + torch.normal(mean=0,
+                [param.clone().detach().flatten() for param in global_model.parameters()]).reshape(-1, 1) + torch.normal(mean=0,
                                                                                                                 std=1e-7,
                                                                                                                 size=(
                                                                                                                 num_params,
                                                                                                                 1)).to(
                 device)
             sanitization_factor = torch.full(size=(wandb.config.nparty, num_params),
-                                             fill_value=(1 / wandb.config.nparty)).to(
-                device)  # sanitization factors for Romoa
+                                             fill_value=(1 / wandb.config.nparty)).to(device)  # sanitization factors for Romoa
 
         train_data, test_data = data_loaders.load_data(wandb.config.dataset, wandb.config.seed)  # load the data
 
-        # assign data to the server and clients
-        server_data, server_label, each_party_data, each_party_label = data_loaders.assign_data(train_data,
-                                                                                                wandb.config.bias,
-                                                                                                device,
-                                                                                                num_labels=num_labels,
-                                                                                                num_workers=wandb.config.nparty,
-                                                                                                server_pc=wandb.config.server_pc,
-                                                                                                p=wandb.config.p,
-                                                                                                dataset=wandb.config.dataset,
-                                                                                                seed=wandb.config.seed,
-                                                                                                task_type=wandb.config.task_type)
+        # todo: assign data to the server and clients
 
         # perform data poisoning attacks
         if wandb.config.byz_type == "label_flipping_attack":
@@ -610,76 +504,61 @@ def main():
 
             os.chdir("..")
 
-        with torch.no_grad():
-            # training
-            all_losses_clients = []
-            all_losses_server = []
-            all_mse = []
-            all_mae = []
-            for e in range(wandb.config.niter):
-                print(f"training epoch {e}/{wandb.config.niter}")
-                net.train()
+        # training
+        client_losses = []
+        server_losses = []
+        all_mse = []
+        all_mae = []
+        global_model.apply(weight_init)
+        for global_epoch in range(wandb.config.niter):
+            print(f"training epoch {global_epoch}/{wandb.config.niter}")
+            global_model.train()
 
-                # perform local training for each party
-                for i in range(wandb.config.nparty):
-                    # reinitialize the model for the next party, as the next party should train a fresh model
-                    net.apply(weight_init)
-                    print(f"the model is initialized with random weights for a local train for party {i}")
-                    net.zero_grad()
-                    for local_e in range(wandb.config.local_epoch):
-                        with torch.enable_grad():
-                            if wandb.config.net == "lr":
-                                minibatch = np.random.choice(list(range(each_party_data[i].shape[0])),
-                                                             size=wandb.config.batch_size, replace=False)
-                                output = net(each_party_data[i][minibatch])
-                                loss = softmax_cross_entropy(output, each_party_label[i][minibatch])
-                            if wandb.config.net == "GCN":
-                                #if not wandb.config.use_agreggation:
-                                optimizer.zero_grad()
-                                preds, logits = net(each_party_data[0][i].float(), each_party_data[1][i].int(),
-                                                    each_party_data[2][i])
-                                loss = loss_fn(preds, each_party_label[i])
-                                all_losses_clients.append(loss)
-
-                            wandb.log({"local_epoch": local_e, "loss_clients": loss})
-                            print(f"local_epoch: {local_e}, loss_clients_{i}: {loss}")
+            # perform local training for each party
+            for client_i in range(wandb.config.nparty):
+                net = copy.deepcopy(global_model).to(device)
+                print(f'client {client_i} is updated from global model')
+                for local_e in range(wandb.config.local_epoch):
+                    if wandb.config.net == "GCN":
+                        for batch in train_data:
+                            batch.to(device)
+                            optimizer.zero_grad()
+                            pred, embedding = net(batch.x.float(), batch.edge_index, batch.batch)
+                            loss = loss_fn(pred, batch.y)
                             loss.backward()
-                            #if not wandb.config.use_agreggation:
                             optimizer.step()
+                            client_losses.append(loss)
+                    if local_e % 100 == 0:
+                        wandb.log({"local_epoch": local_e, "loss_clients": loss})
+                        print(f"local_epoch: {local_e}, loss_clients_{client_i}: {loss}")
 
-                    grad_list.append([param.grad.clone().detach() for param in net.parameters()])
-                    print("the gradients of party {} are appended: ".format(i))
+                grad_list.append([param.grad.clone().detach() for param in net.parameters()])
+                print("the gradients of party {} are appended: ".format(client_i))
 
 
-                # compute server update and append it to the end of the list
-                if wandb.config.aggregation in ["fltrust", "flod"] or wandb.config.byz_type == "fltrust_attack":
-                    # print("train epoch: {} compute server update".format(e))
-                    net.zero_grad()
-                    # reinitialize the model for server to train a fresh model
-                    net.apply(weight_init)
-                    print(f"the model is initialized with random weights for a local train in server")
-                    for local_e in range(wandb.config.local_epoch):
-                        with torch.enable_grad():
-                            if wandb.config.net == "lr":
-                                output = net(server_data)
-                                loss = softmax_cross_entropy(output, server_label)
-                            if wandb.config.net == "GCN":
-                                #if not wandb.config.use_agreggation:
-                                optimizer.zero_grad()
-                                preds, logits = net(server_data[0].float(), server_data[1].int(), server_data[2])
-                                loss = loss_fn(preds, server_label)
-                                all_losses_server.append(loss)
-                            wandb.log({"epoch": e, "loss_server": loss})
-                            print(f"local_epoch: {local_e}, loss_server: {loss}")
+            # compute server update and append it to the end of the list
+            if wandb.config.aggregation in ["fltrust", "flod"] or wandb.config.byz_type == "fltrust_attack":
+                net = copy.deepcopy(global_model).to(device)
+                print(f'server model is updated from global model')
+                for local_e in range(wandb.config.local_epoch):
+                    if wandb.config.net == "GCN":
+                        for batch in train_data:
+                            batch.to(device)
+                            optimizer.zero_grad()
+                            pred, embedding = net(batch.x.float(), batch.edge_index, batch.batch)
+                            loss = loss_fn(pred, batch.y)
                             loss.backward()
-                            #if not wandb.config.use_agreggation:
                             optimizer.step()
-                    grad_list.append([torch.clone(param.grad) for param in net.parameters()])
-                    print("server's gradients are appended: ")
+                            server_losses.append(loss)
+                    if local_e % 100 == 0:
+                        wandb.log({"epoch": global_epoch, "loss_server": loss})
+                        print(f"local_epoch: {local_e}, loss_server: {loss}")
+                grad_list.append([torch.clone(param.grad) for param in net.parameters()])
+                print("server's gradients are appended: ")
 
-                # perform the aggregation
-                # print("train epoch: {} perform the aggregation using {}".format(e, wandb.config.aggregation))
-
+            # perform the aggregation
+            # print("train epoch: {} perform the aggregation using {}".format(e, wandb.config.aggregation))
+            with torch.no_grad():
                 if wandb.config.use_agreggation:
                     if wandb.config.mpspdz:
                         aggregation_rules.mpspdz_aggregation(grad_list, net, wandb.config.lr, wandb.config.nbyz, byz,
@@ -691,11 +570,9 @@ def main():
                         aggregation_rules.fltrust(grad_list, net, wandb.config.lr, wandb.config.nbyz, byz, device)
 
                     elif wandb.config.aggregation == "fedavg":
-                        if wandb.config.dataset == "HAR":
-                            data_sizes = [x.size(dim=0) for x in each_party_data]
                         if wandb.config.dataset == "ESOL":
                             data_sizes = [x.size(dim=0) for x in each_party_label]
-                        aggregation_rules.fedavg(grad_list, net, wandb.config.lr, wandb.config.nbyz, byz, device,
+                        global_model = aggregation_rules.fedavg(grad_list, global_model, wandb.config.lr, wandb.config.nbyz, byz, device,
                                                  data_sizes)
 
                     elif wandb.config.aggregation == "krum":
@@ -717,7 +594,7 @@ def main():
                                                                                                   wandb.config.nbyz,
                                                                                                   byz, device,
                                                                                                   previous_global_gradient,
-                                                                                                  e, previous_gradients)
+                                                                                                  global_epoch, previous_gradients)
 
                     elif wandb.config.aggregation == "flod":
                         aggregation_rules.flod(grad_list, net, wandb.config.lr, wandb.config.nbyz, byz, device,
@@ -748,7 +625,7 @@ def main():
 
                     elif wandb.config.aggregation == "flare":
                         aggregation_rules.flare(grad_list, net, wandb.config.lr, wandb.config.nbyz, byz, device,
-                                                server_data)
+                                                train_data)
 
                     elif wandb.config.aggregation == "romoa":
                         sanitization_factor, previous_global_gradient = aggregation_rules.romoa(grad_list, net,
@@ -765,7 +642,7 @@ def main():
                     del grad_list
                     grad_list = []
                 # evaluate the model accuracy
-                if (e + 1) % wandb.config.test_every == 0:
+                if (global_epoch + 1) % wandb.config.test_every == 0:
                     test_metric, test_success_rate = evaluate_accuracy(test_data, net, device,
                                                                        wandb.config.byz_type == "scaling_attack",
                                                                        wandb.config.dataset)
@@ -773,26 +650,22 @@ def main():
                     # print("test_metric", test_metric)
                     # print("test_success_rate", test_success_rate)
                     test_acc_list.append(test_metric)
-                    test_iterations.append(e)
-                    if wandb.config.dataset == "HAR":
-                        if wandb.config.byz_type == "scaling_attack":
-                            backdoor_success_list.append(test_success_rate)
-                            print("Iteration %02d. Test_acc %0.4f. Backdoor success rate: %0.4f" % (
-                            e, test_metric, test_success_rate))
-                        else:
-                            print("Iteration %02d. Test_acc %0.4f" % (e, test_metric))
+                    test_iterations.append(global_epoch)
                     if wandb.config.dataset == "ESOL":
                         all_mse.append(test_metric)
                         all_mae.append(test_success_rate)
                         wandb.log(
-                            {"Iteration": e, "MeanSquareError": test_metric, "MeanAbsolutError": test_success_rate})
+                            {"Iteration": global_epoch, "MeanSquareError": test_metric, "MeanAbsolutError": test_success_rate})
                         print("Iteration %02d.    MeanSquareError %0.4f    MeanAbsolutError %0.4f" % (
-                        e, test_metric, test_success_rate))
+                        global_epoch, test_metric, test_success_rate))
 
-            # plot_train_loss(all_losses_clients, "clients loss")
-            # plot_train_loss(all_losses_server, "server loss")
-            # plot_train_loss(all_mae, "Mean Absolut Error")
-            # plot_train_loss(all_mse, "Mean Square Error")
+                plot_train_loss(client_losses, "clients loss")
+                #plot_train_loss(server_losses, "server loss")
+                #plot_train_loss(all_mae, "Mean Absolut Error")
+                #plot_train_loss(all_mse, "Mean Square Error")
+
+        # global epochs ended
+
         if wandb.config.mpspdz:
             server_process.wait()  # wait for process to exit
 
@@ -814,13 +687,13 @@ def main():
     del test_acc_list
     test_acc_list = []
 
-    predict(net, test_data, device)
+    predict(global_model, test_data, device)
 
 
 if __name__ == "__main__":
     from sweep_config_my_fl import sweep_config
 
     sweep_id = wandb.sweep(sweep_config, project='sweep_SAFEFL')
-    main()
-    #wandb.agent(sweep_id, function=main, count=10)
+    #main()
+    wandb.agent(sweep_id, function=main, count=1)
 
