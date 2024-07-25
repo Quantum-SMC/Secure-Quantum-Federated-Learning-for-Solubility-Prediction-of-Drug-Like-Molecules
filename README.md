@@ -1,15 +1,13 @@
-# SAFEFL: MPC-friendly framework for Private and Robust Federated Learning
-This project implements several federated learning aggregation rules and attacks.
-We added support for linear regression on the HAR dataset.
+# Secure-Quantum-Federated-Learning-for-Solubility-Prediction-of-Drug-Like-Molecules
+This project enables several pharmaceitical companies to jointly perform federated learning for training a GCN model that predict solubility of drug-like molecules.
 
-Additionally, we implemented [FLTrust](https://arxiv.org/abs/2012.13995) and [FedAvg](https://arxiv.org/abs/1602.05629) in the [MP-SPDZ](https://eprint.iacr.org/2020/521) Multi-Party Computation Framework.
+For more detail refer to [Paper]()
 
-The project is based on code by the authors of [FLTrust](https://arxiv.org/abs/2012.13995) and follows their general structure. 
-The original code is available [here](https://people.duke.edu/~zg70/code/fltrust.zip) and uses the machine learning framework MXNet.
-We adapted the existing code to use PyTorch and extended it.
+The project is based on code by the authors of [SAFEFL](https://ieeexplore.ieee.org/abstract/document/10188630?casa_token=FDcsggxqcvwAAAAA:_JzLcQrYYbLfTwa_KSVOoy8iiDttXEeQ1y33HhvqEJl0BdmfaYHBXVS44Hx5IbdbRKNJTla8dg) and follows their general structure. 
+The original code is available [here](https://github.com/encryptogroup/SAFEFL?tab=readme-ov-file).
 
 ## Aggregation rules
-The following aggregation rules have been implemented:
+The following aggregation rules are added:
 
 - [FedAvg](https://arxiv.org/abs/1602.05629)
 - [Krum](https://papers.nips.cc/paper/2017/hash/f4b9ec30ad9f68f89b29639786cb62ef-Abstract.html)
@@ -27,13 +25,8 @@ The following aggregation rules have been implemented:
 - [SignGuard](https://arxiv.org/abs/2109.05872)
 
 
-All aggregation rules are located in _aggregation_rules.py_ as individual functions and operate on the local gradients and not on the actual local models.
-Working with the gradients or working with the models is equivalent as long as the global model is known. 
-All aggregation rules that normally work on the local models have been modified to work on the local gradients instead.
-
+All aggregation rules are located in _aggregation_rules.py_ as individual functions. 
 To add an aggregation rule you can add the implementation in _aggregation_rules.py_.
-To actually use the aggregation rule during training you must also add a case for the aggregation rule in the main function of the _main.py_ file.
-This calls the aggregation rule and must return the aggregated gradients.
 
 ## Attacks
 To evaluate the robustness of the aggregation rules we also added the following attacks.
@@ -47,15 +40,10 @@ To evaluate the robustness of the aggregation rules we also added the following 
 - [Min-Sum Attack](https://par.nsf.gov/servlets/purl/10286354)
 
 The implementation of the attacks are all located in _attacks.py_ as individual functions.
-
-To add a new attack the implementation can simply be added as a new function in this file. For attacks that are called during the aggregation the signature of the function 
-must be the same format as the other attacks. This is because the attack function call in the training process is overloaded 
-and which attack is called is only determined during runtime. 
-The attack name must also be added to the get_byz function in _main.py_.
-Attacks that only manipulate training data just need to be called before the training starts and don't need a specific signature.
+To add a new attack the implementation can simply be added as a new function in this file.
 
 ## Models
-We implemented multiclass linear regression classifier.
+We implemented a [GCN](https://github.com/petermchale/gnn) for regretion task.
 
 The model is in a separate file in the _models_ folder of this project. 
 
@@ -63,23 +51,19 @@ To add models a new file containing a class that defines this classifier must be
 Additionally, in _main.py_ the _get_net_ function needs to be expanded to enable the selection of this model.
 
 ## Datasets
-We implemented the [HAR](https://upcommons.upc.edu/handle/2117/20897) dataset and as it is not implemented by PyTorch per default. 
+We implemented the [ESOL](https://paperswithcode.com/dataset/esol-scaffold) dataset. 
 It must be downloaded with the provided loading script in the _data_ folder.
 
 Adding a new dataset requires adding the loading to the _load_data_ function in _data_loading.py_. 
-This can either be simply done by adding an existing dataloader from PyTorch or requires custom data loading like in the case with the HAR dataset.
+This can either be simply done by adding an existing dataloader from PyTorch or requires custom data loading.
 Additionally, the size of the data examples and the number of classes need to be added to the _get_shapes_ function to properly configure the model.
 Furthermore, the _assign_data_ function needs to be extended to enable assigning the test and train data to the individual clients.
-Should the evaluation require running the new dataset with the scaling attack, which adds backdoor trigger patterns to the data examples the following functions also need to be extended:
-
-- _scaling_attack_insert_backdoor_
-- _add_backdoor_
-
-Both of these are located in _attacks.py_.
 
 ## Multi-Party Computation
 To run the MPC Implementation the [code](https://github.com/data61/MP-SPDZ) for [MP-SPDZ](https://eprint.iacr.org/2020/521) needs to be downloaded separately using the installation script _mpc_install.sh_.
 The following protocols are supported:
+
+- [MASCOT](https://dl.acm.org/doi/abs/10.1145/2976749.2978357?casa_token=ANhMJsmbD9kAAAAA:uaMV-qJpBFxYVJZekcBq_wk7y7iCWyctOVlNzt30oWfT9Amh5uQG_D5NCb_SybJrV_90sTAcK00O) uses 2 or more parties in a malicious setting 
 - Semi2k uses 2 or more parties in a semi-honest, dishonest majority setting
 - [SPDZ2k](https://eprint.iacr.org/2018/482) uses 2 or more parties in a malicious, dishonest majority setting
 - [Replicated2k](https://eprint.iacr.org/2016/768.pdf) uses 3 parties in a semi-honest, honest majority setting
@@ -87,7 +71,7 @@ The following protocols are supported:
 
 # How to run?
 
-The project can be simply cloned from git and then requires downloading the [HAR](https://upcommons.upc.edu/handle/2117/20897) dataset as described in the dataset section.
+The project can be simply cloned from git and then requires downloading the [ESOL](https://paperswithcode.com/dataset/esol-scaffold) dataset as described in the dataset section.
 
 The project takes multiple command line arguments to determine the training parameters, attack, aggregation, etc. is used.
 If no arguments are provided the project will run with the default arguments.
@@ -109,15 +93,11 @@ The project requires the following packages to be installed:
 All requirements can be found in the _requirements.txt_.
 
 # Credits
-This project is based on code by Cao et al. the authors of [FLTrust](https://arxiv.org/abs/2012.13995) and is available [here](https://people.duke.edu/~zg70/code/fltrust.zip)
+This project is based on code by Till Gehlhar et al. the authors of [SAFEFL](https://ieeexplore.ieee.org/abstract/document/10188630?casa_token=FDcsggxqcvwAAAAA:_JzLcQrYYbLfTwa_KSVOoy8iiDttXEeQ1y33HhvqEJl0BdmfaYHBXVS44Hx5IbdbRKNJTla8dg) and the github code is available [here](https://github.com/encryptogroup/SAFEFL)
 
-We thank the authors of [Romoa](https://link.springer.com/chapter/10.1007/978-3-030-88418-5_23) for providing an implementation of their aggregation.
-
-We used the [open-sourced](https://github.com/vrt1shjwlkr/NDSS21-Model-Poisoning) implementations of the [Min-Max](https://par.nsf.gov/servlets/purl/10286354) and [Min-Sum](https://par.nsf.gov/servlets/purl/10286354) attack.
-
-For the implementation of Flame we used the scikit-learn implementation of [HDBSCAN](https://github.com/scikit-learn-contrib/hdbscan) by McInnes et al.
+We used the [open-sourced](https://github.com/encryptogroup/SAFEFL?tab=readme-ov-file) implementations of all agregation rules and all attacks.
 
 The MPC Framework MP-SPDZ was created by [Marcel Keller](https://github.com/data61/MP-SPDZ).
 
 # License
-[MIT](https://choosealicense.com/licenses/mit/)
+[]()
